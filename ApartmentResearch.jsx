@@ -1,4 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { onAuthStateChanged } from "firebase/auth";
+import {
+  doc, getDoc, setDoc, collection, addDoc, updateDoc, deleteDoc,
+  query, orderBy, getDocs,
+} from "firebase/firestore";
+import { auth, db, signInWithGoogle, signOutUser } from "./src/firebase.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DIMENSIONS = ["noise", "maintenance", "safety", "parking", "internet", "commute", "value"];
@@ -10,75 +16,39 @@ function scoreBg(s)        { return s >= 7 ? "bg-emerald-50 border-emerald-400" 
 function scoreTextColor(s) { return s >= 7 ? "text-emerald-700" : s >= 4 ? "text-amber-700" : "text-red-700"; }
 function scoreBarColor(s)  { return s >= 7 ? "bg-emerald-500" : s >= 4 ? "bg-amber-400" : "bg-red-500"; }
 
-// ─── Gist persistence ─────────────────────────────────────────────────────────
-const GITHUB_TOKEN   = import.meta.env.VITE_GITHUB_TOKEN || "";
-const INDEX_GIST_KEY = "apt-reviews-index-gist-id";
-const INDEX_FILE     = "apartment-reviews-index.json";
-const gistEnabled    = () => Boolean(GITHUB_TOKEN);
+// ─── Firestore persistence ─────────────────────────────────────────────────────
+const EMPTY_PROFILE = { workAddress: "", otherDestinations: [{ label: "", address: "" }], otherNotes: "", budget: "", hasPets: false, priorityDims: [] };
 
-async function gistFetch(path, opts = {}) {
-  const r = await fetch(`https://api.github.com${path}`, {
-    ...opts,
-    headers: {
-      Authorization: `Bearer ${GITHUB_TOKEN}`,
-      Accept: "application/vnd.github+json",
-      "Content-Type": "application/json",
-      ...(opts.headers || {}),
-    },
-  });
-  if (!r.ok) { const t = await r.text(); throw new Error(`GitHub ${r.status}: ${t}`); }
-  if (r.status === 204) return null;
-  return r.json();
+async function loadProfile(uid) {
+  const snap = await getDoc(doc(db, "users", uid));
+  return snap.exists() ? { ...EMPTY_PROFILE, ...snap.data() } : EMPTY_PROFILE;
 }
 
-async function getOrCreateIndex() {
-  const id = localStorage.getItem(INDEX_GIST_KEY);
-  if (id) {
-    try {
-      const g = await gistFetch(`/gists/${id}`);
-      return { id, entries: JSON.parse(g.files[INDEX_FILE]?.content || "[]") };
-    } catch {}
-  }
-  const g = await gistFetch("/gists", {
-    method: "POST",
-    body: JSON.stringify({ description: "Apartment Reviews – Index", public: false, files: { [INDEX_FILE]: { content: "[]" } } }),
-  });
-  localStorage.setItem(INDEX_GIST_KEY, g.id);
-  return { id: g.id, entries: [] };
+async function saveProfile(uid, profile) {
+  await setDoc(doc(db, "users", uid), profile, { merge: true });
 }
 
-async function saveIndex(indexId, entries) {
-  await gistFetch(`/gists/${indexId}`, {
-    method: "PATCH",
-    body: JSON.stringify({ files: { [INDEX_FILE]: { content: JSON.stringify(entries) } } }),
-  });
+async function listSearches(uid) {
+  const snap = await getDocs(query(collection(db, "users", uid, "searches"), orderBy("savedAt", "desc")));
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
 
-async function createSearchGist(apartmentName, payload) {
-  const slug     = apartmentName.toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 40);
-  const filename = `${slug}-${Date.now()}.json`;
-  const g = await gistFetch("/gists", {
-    method: "POST",
-    body: JSON.stringify({ description: `Apartment Research: ${apartmentName}`, public: false, files: { [filename]: { content: JSON.stringify(payload, null, 2) } } }),
-  });
-  return { gistId: g.id, filename };
+async function createSearch(uid, payload) {
+  const ref = await addDoc(collection(db, "users", uid, "searches"), payload);
+  return ref.id;
 }
 
-async function patchSearchGist(gistId, filename, payload) {
-  await gistFetch(`/gists/${gistId}`, {
-    method: "PATCH",
-    body: JSON.stringify({ files: { [filename]: { content: JSON.stringify(payload, null, 2) } } }),
-  });
+async function patchSearch(uid, searchId, payload) {
+  await updateDoc(doc(db, "users", uid, "searches", searchId), payload);
 }
 
-async function fetchSearchGist(gistId) {
-  const g        = await gistFetch(`/gists/${gistId}`);
-  const filename = Object.keys(g.files)[0];
-  return { data: JSON.parse(g.files[filename].content), filename };
+async function fetchSearch(uid, searchId) {
+  const snap = await getDoc(doc(db, "users", uid, "searches", searchId));
+  return snap.exists() ? snap.data() : null;
 }
 
-async function deleteSearchGist(gistId) {
-  await gistFetch(`/gists/${gistId}`, { method: "DELETE" });
+async function deleteSearch(uid, searchId) {
+  await deleteDoc(doc(db, "users", uid, "searches", searchId));
 }
 
 // ─── Google Maps loader ────────────────────────────────────────────────────────
@@ -282,7 +252,7 @@ function SaveBadge({ status }) {
   if (status === "idle") return null;
   const map = {
     saving: { cls: "bg-slate-100 text-slate-500", icon: <Spinner size="h-3 w-3" />, label: "Saving…" },
-    saved:  { cls: "bg-emerald-50 text-emerald-600", icon: "✓", label: "Saved to Gist" },
+    saved:  { cls: "bg-emerald-50 text-emerald-600", icon: "✓", label: "Saved" },
     error:  { cls: "bg-red-50 text-red-500", icon: "⚠", label: "Save failed" },
   };
   const { cls, icon, label } = map[status] || {};
@@ -326,24 +296,25 @@ export default function ApartmentResearch() {
   const placesKey = import.meta.env.VITE_GOOGLE_PLACES_API_KEY || "";
   const claudeKey = import.meta.env.VITE_ANTHROPIC_API_KEY     || "";
 
+  // ── Auth state
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => { setUser(u); setAuthLoading(false); });
+    return unsub;
+  }, []);
+
   // ── Research state
   const [aptName,   setAptName]   = useState("");
   const [aptAddress, setAptAddress] = useState("");
-  const [workAddress, setWorkAddress] = useState(() => localStorage.getItem("apt_research_work_address") || "");
-  const [otherDestinations, setOtherDestinations] = useState(() => {
-    try {
-      const saved = JSON.parse(localStorage.getItem("apt_research_other_destinations") || "null");
-      if (Array.isArray(saved)) return saved;
-      const legacy = localStorage.getItem("apt_research_other_destination");
-      return legacy ? [{ label: "", address: legacy }] : [{ label: "", address: "" }];
-    } catch { return [{ label: "", address: "" }]; }
-  });
-  const [otherNotes, setOtherNotes] = useState(() => localStorage.getItem("apt_research_other_notes") || "");
-  const [budget, setBudget] = useState(() => localStorage.getItem("apt_research_budget") || "");
-  const [hasPets, setHasPets] = useState(() => localStorage.getItem("apt_research_has_pets") === "true");
-  const [priorityDims, setPriorityDims] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("apt_research_priority_dims") || "[]"); } catch { return []; }
-  });
+  const [workAddress, setWorkAddress] = useState("");
+  const [otherDestinations, setOtherDestinations] = useState([{ label: "", address: "" }]);
+  const [otherNotes, setOtherNotes] = useState("");
+  const [budget, setBudget] = useState("");
+  const [hasPets, setHasPets] = useState(false);
+  const [priorityDims, setPriorityDims] = useState([]);
+  const profileLoadedRef = useRef(false); // guards against writing the empty default back over Firestore before the real profile loads
   const [loading,   setLoading]   = useState(false);
   const [error,     setError]     = useState(null);
   const [placeInfo, setPlaceInfo] = useState(null);
@@ -358,44 +329,50 @@ export default function ApartmentResearch() {
 
   // ── Persistence state
   const [savedSearches,  setSavedSearches]  = useState([]);
-  const [indexGistId,    setIndexGistId]    = useState(null);
-  const [currentGistId,  setCurrentGistId]  = useState(null);
-  const [currentFilename,setCurrentFilename]= useState(null);
+  const [currentSearchId,setCurrentSearchId]= useState(null);
   const [saveStatus,     setSaveStatus]     = useState("idle");   // idle|saving|saved|error
-  const [loadingGistId,  setLoadingGistId]  = useState(null);
+  const [loadingSearchId,setLoadingSearchId]= useState(null);
   const [sidebarOpen,    setSidebarOpen]    = useState(true);
   const chatDirtyRef = useRef(false);  // true only when user sent a new message (not a restore)
 
-  // ── Load saved searches on mount
+  // ── Load profile + saved searches when the user signs in
   useEffect(() => {
-    if (!gistEnabled()) return;
+    profileLoadedRef.current = false;
+    if (!user) { setSavedSearches([]); return; }
     (async () => {
       try {
-        const { id, entries } = await getOrCreateIndex();
-        setIndexGistId(id);
-        setSavedSearches(entries.slice().reverse()); // newest first
+        const profile = await loadProfile(user.uid);
+        setWorkAddress(profile.workAddress);
+        setOtherDestinations(profile.otherDestinations.length ? profile.otherDestinations : [{ label: "", address: "" }]);
+        setOtherNotes(profile.otherNotes);
+        setBudget(profile.budget);
+        setHasPets(profile.hasPets);
+        setPriorityDims(profile.priorityDims);
+        profileLoadedRef.current = true;
+
+        const searches = await listSearches(user.uid);
+        setSavedSearches(searches);
       } catch (e) {
-        console.warn("Could not load saved searches:", e.message);
+        console.warn("Could not load profile/saved searches:", e.message);
       }
     })();
-  }, []);
+  }, [user]);
 
   // ── Scroll chat to bottom
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMessages, chatLoading]);
 
-  // ── Persist user priorities locally (personal preferences, not tied to one search)
-  useEffect(() => { localStorage.setItem("apt_research_work_address", workAddress); }, [workAddress]);
-  useEffect(() => { localStorage.setItem("apt_research_other_destinations", JSON.stringify(otherDestinations)); }, [otherDestinations]);
+  // ── Persist user priorities to Firestore (personal preferences, not tied to one search)
+  useEffect(() => {
+    if (!user || !profileLoadedRef.current) return;
+    saveProfile(user.uid, { workAddress, otherDestinations, otherNotes, budget, hasPets, priorityDims })
+      .catch(e => console.warn("Profile save failed:", e.message));
+  }, [user, workAddress, otherDestinations, otherNotes, budget, hasPets, priorityDims]);
 
   const updateDestination = (i, field, value) => {
     setOtherDestinations(prev => prev.map((d, idx) => idx === i ? { ...d, [field]: value } : d));
   };
   const addDestination = () => setOtherDestinations(prev => [...prev, { label: "", address: "" }]);
   const removeDestination = (i) => setOtherDestinations(prev => prev.length === 1 ? prev : prev.filter((_, idx) => idx !== i));
-  useEffect(() => { localStorage.setItem("apt_research_other_notes", otherNotes); }, [otherNotes]);
-  useEffect(() => { localStorage.setItem("apt_research_budget", budget); }, [budget]);
-  useEffect(() => { localStorage.setItem("apt_research_has_pets", String(hasPets)); }, [hasPets]);
-  useEffect(() => { localStorage.setItem("apt_research_priority_dims", JSON.stringify(priorityDims)); }, [priorityDims]);
 
   const togglePriorityDim = (dim) => {
     setPriorityDims(prev => prev.includes(dim) ? prev.filter(d => d !== dim) : [...prev, dim]);
@@ -403,21 +380,14 @@ export default function ApartmentResearch() {
 
   // ── Auto-save when report first loads
   useEffect(() => {
-    if (!report || !gistEnabled() || !indexGistId) return;
+    if (!report || !user) return;
     (async () => {
       setSaveStatus("saving");
       try {
         const payload = { apartmentName: aptName, address: aptAddress, savedAt: new Date().toISOString(), placeInfo, reviews, report, chatHistory: [] };
-        const { gistId, filename } = await createSearchGist(aptName, payload);
-        setCurrentGistId(gistId);
-        setCurrentFilename(filename);
-
-        // Update index
-        const newEntry = { gistId, filename, apartmentName: aptName, address: aptAddress, savedAt: payload.savedAt };
-        const { entries } = await getOrCreateIndex();
-        const updated = [...entries, newEntry];
-        await saveIndex(indexGistId, updated);
-        setSavedSearches(updated.slice().reverse());
+        const id = await createSearch(user.uid, payload);
+        setCurrentSearchId(id);
+        setSavedSearches(prev => [{ id, ...payload }, ...prev]);
         setSaveStatus("saved");
       } catch (e) {
         console.warn("Save failed:", e.message);
@@ -427,19 +397,16 @@ export default function ApartmentResearch() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [report]);
 
-  // ── Auto-update gist when chat changes (only on new user messages)
+  // ── Auto-update saved search when chat changes (only on new user messages)
   useEffect(() => {
-    if (!chatDirtyRef.current || !currentGistId || !currentFilename || !gistEnabled()) return;
+    if (!chatDirtyRef.current || !currentSearchId || !user) return;
     chatDirtyRef.current = false;
     (async () => {
       try {
-        const payload = { apartmentName: aptName, address: aptAddress, savedAt: new Date().toISOString(), placeInfo, reviews, report, chatHistory: chatMessages };
-        await patchSearchGist(currentGistId, currentFilename, payload);
-        // Update savedAt in index
-        const { id: idxId, entries } = await getOrCreateIndex();
-        const updated = entries.map(e => e.gistId === currentGistId ? { ...e, savedAt: payload.savedAt } : e);
-        await saveIndex(idxId, updated);
-        setSavedSearches(updated.slice().reverse());
+        const savedAt = new Date().toISOString();
+        await patchSearch(user.uid, currentSearchId, { savedAt, chatHistory: chatMessages });
+        setSavedSearches(prev => prev.map(e => e.id === currentSearchId ? { ...e, savedAt } : e)
+          .sort((a, b) => new Date(b.savedAt) - new Date(a.savedAt)));
       } catch (e) {
         console.warn("Chat sync failed:", e.message);
       }
@@ -452,7 +419,7 @@ export default function ApartmentResearch() {
     if (!aptName.trim() || !aptAddress.trim()) { setError("Please enter an apartment name and address."); return; }
     if (!placesKey || !claudeKey) { setError("API keys missing — check your .env file."); return; }
     setLoading(true); setError(null); setReport(null); setPlaceInfo(null);
-    setReviews([]); setChatMessages([]); setCurrentGistId(null); setCurrentFilename(null);
+    setReviews([]); setChatMessages([]); setCurrentSearchId(null);
     setSaveStatus("idle"); chatDirtyRef.current = false;
 
     try {
@@ -518,10 +485,11 @@ Schema:
 
   // ── Load saved search
   const handleLoadSearch = useCallback(async (entry) => {
-    if (loadingGistId) return;
-    setLoadingGistId(entry.gistId);
+    if (loadingSearchId || !user) return;
+    setLoadingSearchId(entry.id);
     try {
-      const { data } = await fetchSearchGist(entry.gistId);
+      const data = await fetchSearch(user.uid, entry.id);
+      if (!data) throw new Error("Search not found.");
       chatDirtyRef.current = false;
       setAptName(data.apartmentName);
       setAptAddress(data.address);
@@ -529,33 +497,30 @@ Schema:
       setReviews(data.reviews || []);
       setReport(data.report);
       setChatMessages(data.chatHistory || []);
-      setCurrentGistId(entry.gistId);
-      setCurrentFilename(entry.filename);
+      setCurrentSearchId(entry.id);
       setSaveStatus("saved");
       setError(null);
     } catch (e) {
       setError("Failed to load saved search: " + e.message);
     } finally {
-      setLoadingGistId(null);
+      setLoadingSearchId(null);
     }
-  }, [loadingGistId]);
+  }, [loadingSearchId, user]);
 
   // ── Delete saved search
   const handleDeleteSearch = useCallback(async (entry) => {
+    if (!user) return;
     try {
-      await deleteSearchGist(entry.gistId);
-      const { id: idxId, entries } = await getOrCreateIndex();
-      const updated = entries.filter(e => e.gistId !== entry.gistId);
-      await saveIndex(idxId, updated);
-      setSavedSearches(updated.slice().reverse());
-      if (currentGistId === entry.gistId) {
+      await deleteSearch(user.uid, entry.id);
+      setSavedSearches(prev => prev.filter(e => e.id !== entry.id));
+      if (currentSearchId === entry.id) {
         setReport(null); setPlaceInfo(null); setReviews([]); setChatMessages([]);
-        setCurrentGistId(null); setCurrentFilename(null); setSaveStatus("idle");
+        setCurrentSearchId(null); setSaveStatus("idle");
       }
     } catch (e) {
       console.warn("Delete failed:", e.message);
     }
-  }, [currentGistId]);
+  }, [currentSearchId, user]);
 
   // ── Chat
   const handleChat = useCallback(async (message) => {
@@ -587,42 +552,78 @@ Schema:
   const apartmentsUrl= `https://www.apartments.com/search-results/?query=${encodeURIComponent(aptName)}`;
   const mapsUrl      = `https://www.google.com/maps/search/${encodeURIComponent(aptAddress)}`;
 
-  const hasSidebar   = gistEnabled() && savedSearches.length > 0;
+  const hasSidebar = savedSearches.length > 0;
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-100 to-blue-50 flex items-center justify-center">
+        <Spinner size="h-8 w-8 text-slate-400" />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-slate-100 to-blue-50 flex items-center justify-center px-4">
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 max-w-sm w-full text-center">
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-blue-600 shadow-md mb-4">
+            <span className="text-2xl">🏢</span>
+          </div>
+          <h1 className="text-xl font-bold text-slate-900 tracking-tight">Apartment Research Tool</h1>
+          <p className="text-slate-500 mt-1.5 text-sm mb-6">Sign in to save your priorities and research history to your account.</p>
+          <button
+            onClick={() => signInWithGoogle().catch(e => setError(e.message))}
+            className="w-full flex items-center justify-center gap-2.5 bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 font-semibold py-2.5 px-4 rounded-xl transition-colors text-sm shadow-sm"
+          >
+            <svg className="w-4 h-4" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20.5H24v7h11.3c-1.6 4.6-6 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l5-5C33.9 6.1 29.2 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.7-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l5.7 4.2C13.6 15.1 18.4 12 24 12c3.1 0 5.8 1.1 8 3l5-5C33.9 6.1 29.2 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.3 0-9.7-3.4-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20.5H24v7h11.3c-.8 2.3-2.2 4.2-4.1 5.6l6.2 5.2C40.9 35.2 44 30 44 24c0-1.3-.1-2.7-.4-3.5z"/></svg>
+            Sign in with Google
+          </button>
+          {error && <p className="text-red-600 text-xs mt-3">{error}</p>}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-100 to-blue-50">
       <div className={`flex ${hasSidebar ? "max-w-5xl" : "max-w-2xl"} mx-auto py-10 px-4 gap-6 transition-all`}>
 
         {/* ── Sidebar ──────────────────────────────────────────────── */}
-        {gistEnabled() && (
-          <div className={`shrink-0 transition-all duration-300 ${sidebarOpen && hasSidebar ? "w-60" : "w-0 overflow-hidden"}`}>
-            <div className="w-60 space-y-2 sticky top-10">
-              <div className="flex items-center justify-between mb-3">
-                <h2 className="text-sm font-semibold text-slate-700">Saved Searches</h2>
-                <span className="text-xs text-slate-400">{savedSearches.length}</span>
-              </div>
-              {savedSearches.length === 0 && (
-                <p className="text-xs text-slate-400 leading-relaxed">Your researched apartments will appear here.</p>
-              )}
-              {savedSearches.map(entry => (
-                <SavedSearchCard
-                  key={entry.gistId}
-                  entry={entry}
-                  active={currentGistId === entry.gistId}
-                  loading={loadingGistId === entry.gistId}
-                  onLoad={() => handleLoadSearch(entry)}
-                  onDelete={() => handleDeleteSearch(entry)}
-                />
-              ))}
+        <div className={`shrink-0 transition-all duration-300 ${sidebarOpen && hasSidebar ? "w-60" : "w-0 overflow-hidden"}`}>
+          <div className="w-60 space-y-2 sticky top-10">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-sm font-semibold text-slate-700">Saved Searches</h2>
+              <span className="text-xs text-slate-400">{savedSearches.length}</span>
             </div>
+            {savedSearches.length === 0 && (
+              <p className="text-xs text-slate-400 leading-relaxed">Your researched apartments will appear here.</p>
+            )}
+            {savedSearches.map(entry => (
+              <SavedSearchCard
+                key={entry.id}
+                entry={entry}
+                active={currentSearchId === entry.id}
+                loading={loadingSearchId === entry.id}
+                onLoad={() => handleLoadSearch(entry)}
+                onDelete={() => handleDeleteSearch(entry)}
+              />
+            ))}
           </div>
-        )}
+        </div>
 
         {/* ── Main content ─────────────────────────────────────────── */}
         <div className="flex-1 min-w-0 space-y-6">
 
           {/* Header */}
-          <div className="text-center">
+          <div className="text-center relative">
+            <button
+              onClick={() => signOutUser()}
+              className="absolute right-0 top-0 text-xs text-slate-400 hover:text-slate-600 transition-colors flex items-center gap-1.5"
+              title={user.email}
+            >
+              {user.photoURL && <img src={user.photoURL} alt="" className="w-5 h-5 rounded-full" />}
+              Sign out
+            </button>
             <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-blue-600 shadow-md mb-4">
               <span className="text-2xl">🏢</span>
             </div>
@@ -639,7 +640,7 @@ Schema:
               </h2>
               <div className="flex items-center gap-2">
                 <SaveBadge status={saveStatus} />
-                {gistEnabled() && hasSidebar && (
+                {hasSidebar && (
                   <button onClick={() => setSidebarOpen(!sidebarOpen)} className="text-xs text-slate-400 hover:text-slate-600 transition-colors">
                     {sidebarOpen ? "Hide history" : "Show history"}
                   </button>
@@ -716,11 +717,6 @@ Schema:
               </div>
             )}
 
-            {!gistEnabled() && (
-              <p className="mt-3 text-xs text-slate-400 text-center">
-                Add <code className="bg-slate-100 px-1 rounded">VITE_GITHUB_TOKEN</code> to .env to enable search history
-              </p>
-            )}
           </div>
 
           {/* ── Report card ────────────────────────────────────────── */}
