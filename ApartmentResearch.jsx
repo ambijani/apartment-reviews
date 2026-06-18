@@ -472,16 +472,18 @@ export default function ApartmentResearch() {
         : `<2-3 sentences: Based on the reviews, who would be happy living here and who wouldn't?>`;
       const systemPrompt = `You are an expert apartment analyst. Analyze resident reviews and score the apartment across 7 dimensions. Respond ONLY with valid JSON — no markdown fences, no preamble.
 
+For each dimension, "sourceReview" must be the number (e.g. 1, 2, 3...) of the specific review your "reason" is drawn from, matching the "Review #N" labels below. If the score is a general inference not tied to one specific review (e.g. no review mentioned the topic at all), set "sourceReview" to null instead of guessing.
+
 Schema:
 {
   "scores": {
-    "noise":       { "score": <1-10>, "reason": "<one line from reviews>" },
-    "maintenance": { "score": <1-10>, "reason": "<one line from reviews>" },
-    "safety":      { "score": <1-10>, "reason": "<one line from reviews>" },
-    "parking":     { "score": <1-10>, "reason": "<one line from reviews>" },
-    "internet":    { "score": <1-10>, "reason": "<one line from reviews>" },
-    "commute":     { "score": <1-10>, "reason": "<one line from reviews>" },
-    "value":       { "score": <1-10>, "reason": "<one line from reviews>" }
+    "noise":       { "score": <1-10>, "reason": "<one line from reviews>", "sourceReview": <N or null> },
+    "maintenance": { "score": <1-10>, "reason": "<one line from reviews>", "sourceReview": <N or null> },
+    "safety":      { "score": <1-10>, "reason": "<one line from reviews>", "sourceReview": <N or null> },
+    "parking":     { "score": <1-10>, "reason": "<one line from reviews>", "sourceReview": <N or null> },
+    "internet":    { "score": <1-10>, "reason": "<one line from reviews>", "sourceReview": <N or null> },
+    "commute":     { "score": <1-10>, "reason": "<one line from reviews>", "sourceReview": <N or null> },
+    "value":       { "score": <1-10>, "reason": "<one line from reviews>", "sourceReview": <N or null> }
   },
   "happy_here": "${happyHereInstruction}"
 }`;
@@ -762,6 +764,7 @@ Schema:
                 {DIMENSIONS.map(dim => {
                   const d = report.scores?.[dim];
                   if (!d) return null;
+                  const sourceReview = d.sourceReview ? reviews[d.sourceReview - 1] : null;
                   return (
                     <div key={dim} className={`border-2 rounded-xl p-3.5 ${scoreBg(d.score)}`}>
                       <div className="flex items-center justify-between mb-2">
@@ -778,6 +781,13 @@ Schema:
                         </div>
                       </div>
                       <p className="text-xs text-slate-600 leading-snug">{d.reason}</p>
+                      {sourceReview ? (
+                        <div className="mt-2">
+                          <SourceChip src={{ name: sourceReview.author_name, rating: sourceReview.rating, text: sourceReview.text, url: sourceReview.author_url || null }} />
+                        </div>
+                      ) : (
+                        <p className="text-xs text-slate-400 italic mt-2" title="Claude didn't cite a specific review for this — it may be inferring from general patterns, or this could be a hallucination. Verify against the actual reviews if it matters.">Not tied to a specific review ⚠️ unverified, could be a hallucination</p>
+                      )}
                     </div>
                   );
                 })}
