@@ -85,8 +85,21 @@ function loadGoogleMaps(apiKey) {
   return mapsLoadPromise;
 }
 
+function findPlaceOnce(svc, query) {
+  return new Promise((resolve) => {
+    svc.findPlaceFromQuery({ query, fields: ["place_id", "name"] }, (results, status) => {
+      if (status !== window.google.maps.places.PlacesServiceStatus.OK || !results?.[0]) {
+        resolve({ status, place: null }); return;
+      }
+      svc.getDetails({ placeId: results[0].place_id, fields: ["name", "formatted_address", "reviews", "rating", "url"] }, (place, ds) => {
+        resolve({ status: ds, place: ds === window.google.maps.places.PlacesServiceStatus.OK ? place : null });
+      });
+    });
+  });
+}
+
 function getPlaceWithReviews(name, addr) {
-  return new Promise((resolve, reject) => {
+  return new Promise(async (resolve, reject) => {
     const container = document.createElement("div");
     container.style.display = "none";
     document.body.appendChild(container);
@@ -96,22 +109,24 @@ function getPlaceWithReviews(name, addr) {
     try { map = new window.google.maps.Map(container, { center: { lat: 0, lng: 0 }, zoom: 1 }); }
     catch (e) { clearTimeout(hang); cleanup(); reject(new Error("Failed to init Google Maps: " + e.message)); return; }
     const svc = new window.google.maps.places.PlacesService(map);
-    svc.findPlaceFromQuery({ query: `${name} ${addr}`, fields: ["place_id", "name"] }, (results, status) => {
-      if (status !== window.google.maps.places.PlacesServiceStatus.OK || !results?.[0]) {
-        clearTimeout(hang); cleanup();
-        reject(new Error(status === "REQUEST_DENIED"
-          ? "Google Places API key is invalid or unauthorized."
-          : `Couldn't find this apartment (status: ${status}).`));
-        return;
-      }
-      svc.getDetails({ placeId: results[0].place_id, fields: ["name", "formatted_address", "reviews", "rating", "url"] }, (place, ds) => {
-        clearTimeout(hang); cleanup();
-        if (ds !== window.google.maps.places.PlacesServiceStatus.OK || !place) {
-          reject(new Error(`Couldn't load place details (status: ${ds}).`)); return;
-        }
-        resolve(place);
-      });
-    });
+
+    // A full street address combined with the name can make Places resolve to the literal
+    // geocoded address point (no reviews) instead of the named business listing, so the
+    // name alone is tried first since that's what actually finds the reviewable POI.
+    let { status, place } = await findPlaceOnce(svc, name);
+    if (!place || !place.reviews?.length) {
+      const fallback = await findPlaceOnce(svc, `${name} ${addr}`);
+      if (fallback.place) { status = fallback.status; place = fallback.place; }
+    }
+
+    clearTimeout(hang); cleanup();
+    if (!place) {
+      reject(new Error(status === "REQUEST_DENIED"
+        ? "Google Places API key is invalid or unauthorized."
+        : `Couldn't find this apartment (status: ${status}).`));
+      return;
+    }
+    resolve(place);
   });
 }
 
