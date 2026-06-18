@@ -330,7 +330,14 @@ export default function ApartmentResearch() {
   const [aptName,   setAptName]   = useState("");
   const [aptAddress, setAptAddress] = useState("");
   const [workAddress, setWorkAddress] = useState(() => localStorage.getItem("apt_research_work_address") || "");
-  const [otherDestination, setOtherDestination] = useState(() => localStorage.getItem("apt_research_other_destination") || "");
+  const [otherDestinations, setOtherDestinations] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("apt_research_other_destinations") || "null");
+      if (Array.isArray(saved)) return saved;
+      const legacy = localStorage.getItem("apt_research_other_destination");
+      return legacy ? [{ label: "", address: legacy }] : [{ label: "", address: "" }];
+    } catch { return [{ label: "", address: "" }]; }
+  });
   const [otherNotes, setOtherNotes] = useState(() => localStorage.getItem("apt_research_other_notes") || "");
   const [budget, setBudget] = useState(() => localStorage.getItem("apt_research_budget") || "");
   const [hasPets, setHasPets] = useState(() => localStorage.getItem("apt_research_has_pets") === "true");
@@ -378,7 +385,13 @@ export default function ApartmentResearch() {
 
   // ── Persist user priorities locally (personal preferences, not tied to one search)
   useEffect(() => { localStorage.setItem("apt_research_work_address", workAddress); }, [workAddress]);
-  useEffect(() => { localStorage.setItem("apt_research_other_destination", otherDestination); }, [otherDestination]);
+  useEffect(() => { localStorage.setItem("apt_research_other_destinations", JSON.stringify(otherDestinations)); }, [otherDestinations]);
+
+  const updateDestination = (i, field, value) => {
+    setOtherDestinations(prev => prev.map((d, idx) => idx === i ? { ...d, [field]: value } : d));
+  };
+  const addDestination = () => setOtherDestinations(prev => [...prev, { label: "", address: "" }]);
+  const removeDestination = (i) => setOtherDestinations(prev => prev.length === 1 ? prev : prev.filter((_, idx) => idx !== i));
   useEffect(() => { localStorage.setItem("apt_research_other_notes", otherNotes); }, [otherNotes]);
   useEffect(() => { localStorage.setItem("apt_research_budget", budget); }, [budget]);
   useEffect(() => { localStorage.setItem("apt_research_has_pets", String(hasPets)); }, [hasPets]);
@@ -453,16 +466,19 @@ export default function ApartmentResearch() {
 
       const reviewText = formatReviewsForPrompt(trimmed);
 
-      const workCommute  = await getCommuteInfo(place.formatted_address, workAddress.trim());
-      const otherCommute = await getCommuteInfo(place.formatted_address, otherDestination.trim());
+      const workCommute = await getCommuteInfo(place.formatted_address, workAddress.trim());
+      const validDestinations = otherDestinations.filter(d => d.address.trim());
+      const otherCommutes = await Promise.all(validDestinations.map(d => getCommuteInfo(place.formatted_address, d.address.trim())));
 
       const contextLines = [];
       if (workAddress.trim()) {
         contextLines.push(`Work location: ${workAddress.trim()}` + (workCommute ? ` (commute: ${workCommute.durationText}, ${workCommute.distanceText})` : ""));
       }
-      if (otherDestination.trim()) {
-        contextLines.push(`Frequent destination: ${otherDestination.trim()}` + (otherCommute ? ` (commute: ${otherCommute.durationText}, ${otherCommute.distanceText})` : ""));
-      }
+      validDestinations.forEach((d, i) => {
+        const commute = otherCommutes[i];
+        const label = d.label.trim() || `Frequent destination ${i + 1}`;
+        contextLines.push(`${label}: ${d.address.trim()}` + (commute ? ` (commute: ${commute.durationText}, ${commute.distanceText})` : ""));
+      });
       if (budget.trim()) contextLines.push(`Budget: ${budget.trim()}`);
       if (hasPets) contextLines.push(`Has pets`);
       if (priorityDims.length) contextLines.push(`Especially cares about: ${priorityDims.map(d => DIM_LABELS[d]).join(", ")}`);
@@ -648,8 +664,17 @@ Schema:
                     <input type="text" value={workAddress} onChange={e => setWorkAddress(e.target.value)} placeholder="e.g. 250 E John Carpenter Fwy, Irving, TX" className="w-full px-3.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow" />
                   </div>
                   <div>
-                    <label className="block text-xs text-slate-600 mb-1">Other frequent destination</label>
-                    <input type="text" value={otherDestination} onChange={e => setOtherDestination(e.target.value)} placeholder="e.g. your place of worship, gym, family" className="w-full px-3.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow" />
+                    <label className="block text-xs text-slate-600 mb-1">Other frequent destinations</label>
+                    <div className="space-y-1.5">
+                      {otherDestinations.map((d, i) => (
+                        <div key={i} className="flex gap-1.5">
+                          <input type="text" value={d.label} onChange={e => updateDestination(i, "label", e.target.value)} placeholder="Label (e.g. place of worship)" className="w-32 px-2.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow shrink-0" />
+                          <input type="text" value={d.address} onChange={e => updateDestination(i, "address", e.target.value)} placeholder="Address" className="flex-1 px-2.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow min-w-0" />
+                          <button type="button" onClick={() => removeDestination(i)} disabled={otherDestinations.length === 1} className="text-slate-400 hover:text-red-500 disabled:opacity-30 disabled:cursor-not-allowed px-1 shrink-0" aria-label="Remove destination">✕</button>
+                        </div>
+                      ))}
+                    </div>
+                    <button type="button" onClick={addDestination} className="mt-1.5 text-xs text-blue-600 hover:text-blue-700 font-medium">+ Add another destination</button>
                   </div>
                   <div className="flex gap-2.5">
                     <div className="flex-1">
