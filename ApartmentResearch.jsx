@@ -4,7 +4,7 @@ import {
   doc, getDoc, setDoc, collection, addDoc, updateDoc, deleteDoc,
   query, orderBy, getDocs,
 } from "firebase/firestore";
-import { auth, db, signInWithGoogle, signOutUser } from "./src/firebase.js";
+import { auth, db, signInWithGoogle, signInAsGuest, signOutUser } from "./src/firebase.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DIMENSIONS = ["noise", "maintenance", "safety", "parking", "internet", "commute", "value"];
@@ -578,6 +578,12 @@ Schema:
             <svg className="w-4 h-4" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5H42V20.5H24v7h11.3c-1.6 4.6-6 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l5-5C33.9 6.1 29.2 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.7-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l5.7 4.2C13.6 15.1 18.4 12 24 12c3.1 0 5.8 1.1 8 3l5-5C33.9 6.1 29.2 4 24 4 16.3 4 9.7 8.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.2 0 9.9-2 13.4-5.2l-6.2-5.2C29.2 35.1 26.7 36 24 36c-5.3 0-9.7-3.4-11.3-8l-6.5 5C9.5 39.6 16.2 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20.5H24v7h11.3c-.8 2.3-2.2 4.2-4.1 5.6l6.2 5.2C40.9 35.2 44 30 44 24c0-1.3-.1-2.7-.4-3.5z"/></svg>
             Sign in with Google
           </button>
+          <button
+            onClick={() => signInAsGuest().catch(e => setError(e.message))}
+            className="w-full text-slate-400 hover:text-slate-600 text-xs mt-3 transition-colors"
+          >
+            Just want to try it out? Continue as guest
+          </button>
           {error && <p className="text-red-600 text-xs mt-3">{error}</p>}
         </div>
       </div>
@@ -629,6 +635,11 @@ Schema:
             </div>
             <h1 className="text-3xl font-bold text-slate-900 tracking-tight">Apartment Research Tool</h1>
             <p className="text-slate-500 mt-1.5 text-sm">AI-powered analysis from real Google reviews</p>
+            {user.isAnonymous && (
+              <p className="text-amber-600 bg-amber-50 border border-amber-200 rounded-full inline-block px-3 py-1 text-xs mt-3">
+                Browsing as guest — your data won't be saved if you sign out or clear cookies. <button onClick={() => signInWithGoogle().catch(e => setError(e.message))} className="underline font-medium hover:text-amber-700">Sign in with Google</button> to keep it.
+              </p>
+            )}
           </div>
 
           {/* ── Input card ─────────────────────────────────────────── */}
