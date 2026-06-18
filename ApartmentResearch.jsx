@@ -145,6 +145,24 @@ function getPlaceWithReviews(name, addr) {
   });
 }
 
+function getCommuteInfo(originAddr, destAddr) {
+  return new Promise((resolve) => {
+    if (!originAddr?.trim() || !destAddr?.trim() || !window.google?.maps) { resolve(null); return; }
+    try {
+      const svc = new window.google.maps.DistanceMatrixService();
+      svc.getDistanceMatrix({
+        origins: [originAddr],
+        destinations: [destAddr],
+        travelMode: window.google.maps.TravelMode.DRIVING,
+      }, (response, status) => {
+        const el = response?.rows?.[0]?.elements?.[0];
+        if (status !== "OK" || !el || el.status !== "OK") { resolve(null); return; }
+        resolve({ distanceText: el.distance.text, durationText: el.duration.text });
+      });
+    } catch { resolve(null); }
+  });
+}
+
 // ─── Claude ───────────────────────────────────────────────────────────────────
 async function callClaude(messages, systemPrompt, claudeKey) {
   const r = await fetch("https://api.anthropic.com/v1/messages", {
@@ -311,6 +329,14 @@ export default function ApartmentResearch() {
   // ── Research state
   const [aptName,   setAptName]   = useState("");
   const [aptAddress, setAptAddress] = useState("");
+  const [workAddress, setWorkAddress] = useState(() => localStorage.getItem("apt_research_work_address") || "");
+  const [otherDestination, setOtherDestination] = useState(() => localStorage.getItem("apt_research_other_destination") || "");
+  const [otherNotes, setOtherNotes] = useState(() => localStorage.getItem("apt_research_other_notes") || "");
+  const [budget, setBudget] = useState(() => localStorage.getItem("apt_research_budget") || "");
+  const [hasPets, setHasPets] = useState(() => localStorage.getItem("apt_research_has_pets") === "true");
+  const [priorityDims, setPriorityDims] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("apt_research_priority_dims") || "[]"); } catch { return []; }
+  });
   const [loading,   setLoading]   = useState(false);
   const [error,     setError]     = useState(null);
   const [placeInfo, setPlaceInfo] = useState(null);
@@ -349,6 +375,18 @@ export default function ApartmentResearch() {
 
   // ── Scroll chat to bottom
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [chatMessages, chatLoading]);
+
+  // ── Persist user priorities locally (personal preferences, not tied to one search)
+  useEffect(() => { localStorage.setItem("apt_research_work_address", workAddress); }, [workAddress]);
+  useEffect(() => { localStorage.setItem("apt_research_other_destination", otherDestination); }, [otherDestination]);
+  useEffect(() => { localStorage.setItem("apt_research_other_notes", otherNotes); }, [otherNotes]);
+  useEffect(() => { localStorage.setItem("apt_research_budget", budget); }, [budget]);
+  useEffect(() => { localStorage.setItem("apt_research_has_pets", String(hasPets)); }, [hasPets]);
+  useEffect(() => { localStorage.setItem("apt_research_priority_dims", JSON.stringify(priorityDims)); }, [priorityDims]);
+
+  const togglePriorityDim = (dim) => {
+    setPriorityDims(prev => prev.includes(dim) ? prev.filter(d => d !== dim) : [...prev, dim]);
+  };
 
   // ── Auto-save when report first loads
   useEffect(() => {
@@ -413,7 +451,27 @@ export default function ApartmentResearch() {
       setReviews(trimmed);
       setPlaceInfo({ name: place.name, address: place.formatted_address });
 
-      const reviewText   = formatReviewsForPrompt(trimmed);
+      const reviewText = formatReviewsForPrompt(trimmed);
+
+      const workCommute  = await getCommuteInfo(place.formatted_address, workAddress.trim());
+      const otherCommute = await getCommuteInfo(place.formatted_address, otherDestination.trim());
+
+      const contextLines = [];
+      if (workAddress.trim()) {
+        contextLines.push(`Work location: ${workAddress.trim()}` + (workCommute ? ` (commute: ${workCommute.durationText}, ${workCommute.distanceText})` : ""));
+      }
+      if (otherDestination.trim()) {
+        contextLines.push(`Frequent destination: ${otherDestination.trim()}` + (otherCommute ? ` (commute: ${otherCommute.durationText}, ${otherCommute.distanceText})` : ""));
+      }
+      if (budget.trim()) contextLines.push(`Budget: ${budget.trim()}`);
+      if (hasPets) contextLines.push(`Has pets`);
+      if (priorityDims.length) contextLines.push(`Especially cares about: ${priorityDims.map(d => DIM_LABELS[d]).join(", ")}`);
+      if (otherNotes.trim()) contextLines.push(`Other priorities: ${otherNotes.trim()}`);
+      const contextSummary = contextLines.join("\n");
+
+      const happyHereInstruction = contextSummary
+        ? `<2-3 sentences: Given the following about the person —\n${contextSummary}\n— would they be happy living here? Weigh their stated priorities (including any commute times given) directly against what the reviews say.>`
+        : `<2-3 sentences: Based on the reviews, who would be happy living here and who wouldn't?>`;
       const systemPrompt = `You are an expert apartment analyst. Analyze resident reviews and score the apartment across 7 dimensions. Respond ONLY with valid JSON — no markdown fences, no preamble.
 
 Schema:
@@ -427,12 +485,13 @@ Schema:
     "commute":     { "score": <1-10>, "reason": "<one line from reviews>" },
     "value":       { "score": <1-10>, "reason": "<one line from reviews>" }
   },
-  "happy_here": "<2-3 sentences: Would someone who works at Wells Fargo Las Colinas (Irving, TX) and attends Lewisville Jamatkhana frequently be happy here?>"
+  "happy_here": "${happyHereInstruction}"
 }`;
       const raw  = await callClaude([{ role: "user", content: `Apartment: ${aptName}\nAddress: ${aptAddress}\n\nReviews:\n\n${reviewText}` }], systemPrompt, claudeKey);
       let parsed;
       try { parsed = JSON.parse(raw); }
       catch { const m = raw.match(/\{[\s\S]*\}/); if (!m) throw new Error("Claude returned unexpected format."); parsed = JSON.parse(m[0]); }
+      parsed.userContext = contextSummary;
       setReport(parsed);
     } catch (e) {
       setError(e.message || "An unexpected error occurred.");
@@ -581,6 +640,45 @@ Schema:
                 <label className="block text-sm font-medium text-slate-700 mb-1">Apartment Address</label>
                 <input type="text" value={aptAddress} onChange={e => setAptAddress(e.target.value)} onKeyDown={e => e.key === "Enter" && handleResearch()} placeholder="e.g. 400 E Las Colinas Blvd, Irving, TX 75039" className="w-full px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow" />
               </div>
+              <div className="pt-1 border-t border-slate-100">
+                <p className="text-xs font-medium text-slate-500 mt-2.5 mb-2">Your priorities <span className="text-slate-400 font-normal">(optional — tailors "Would you be happy here?")</span></p>
+                <div className="space-y-2.5">
+                  <div>
+                    <label className="block text-xs text-slate-600 mb-1">Work address</label>
+                    <input type="text" value={workAddress} onChange={e => setWorkAddress(e.target.value)} placeholder="e.g. 250 E John Carpenter Fwy, Irving, TX" className="w-full px-3.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-600 mb-1">Other frequent destination</label>
+                    <input type="text" value={otherDestination} onChange={e => setOtherDestination(e.target.value)} placeholder="e.g. your place of worship, gym, family" className="w-full px-3.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow" />
+                  </div>
+                  <div className="flex gap-2.5">
+                    <div className="flex-1">
+                      <label className="block text-xs text-slate-600 mb-1">Budget</label>
+                      <input type="text" value={budget} onChange={e => setBudget(e.target.value)} placeholder="e.g. up to $1,800/mo" className="w-full px-3.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow" />
+                    </div>
+                    <label className="flex items-center gap-1.5 text-xs text-slate-600 select-none mt-5 shrink-0">
+                      <input type="checkbox" checked={hasPets} onChange={e => setHasPets(e.target.checked)} className="rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+                      Have pets
+                    </label>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-600 mb-1">What matters most to you?</label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {DIMENSIONS.map(dim => (
+                        <button key={dim} type="button" onClick={() => togglePriorityDim(dim)}
+                          className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${priorityDims.includes(dim) ? "bg-blue-600 border-blue-600 text-white" : "bg-white border-slate-300 text-slate-600 hover:border-blue-400"}`}>
+                          {DIM_ICONS[dim]} {DIM_LABELS[dim]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-slate-600 mb-1">Anything else that matters</label>
+                    <textarea value={otherNotes} onChange={e => setOtherNotes(e.target.value)} rows={2} placeholder="e.g. light sleeper, work from home, tight move-in timeline" className="w-full px-3.5 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow resize-none" />
+                  </div>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Commute times are calculated automatically. Saved on this device for next time.</p>
+              </div>
               <button onClick={handleResearch} disabled={loading} className="w-full bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:opacity-60 disabled:cursor-not-allowed text-white font-semibold py-3 px-6 rounded-xl transition-colors flex items-center justify-center gap-2 text-sm shadow-sm">
                 {loading ? <><Spinner /><span>Researching apartment…</span></> : <><span>🔍</span><span>Research This Apartment</span></>}
               </button>
@@ -644,7 +742,9 @@ Schema:
                   <div>
                     <h3 className="font-semibold text-blue-900 text-sm mb-1">Would you be happy here?</h3>
                     <p className="text-blue-800 text-sm leading-relaxed">{report.happy_here}</p>
-                    <p className="text-blue-400 text-xs mt-1.5 italic">Context: Wells Fargo Las Colinas (Irving, TX) + Lewisville Jamatkhana</p>
+                    {report.userContext && (
+                      <p className="text-blue-400 text-xs mt-1.5 italic">Context: {report.userContext}</p>
+                    )}
                   </div>
                 </div>
               </div>
